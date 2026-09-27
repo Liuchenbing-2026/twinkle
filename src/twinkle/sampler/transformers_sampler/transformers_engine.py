@@ -36,8 +36,32 @@ from twinkle.utils import torch_util
 logger = get_logger()
 
 
+def _resolve_model_cls(model_cls: Any):
+    """The transformers class to ``from_pretrained`` with.
+
+    Defaults to ``AutoModelForCausalLM`` (plain text generation). A vision-language checkpoint's
+    config is not a causal-LM config, so ``AutoModelForCausalLM`` rejects it -- the caller supplies
+    the family's real ``...ForConditionalGeneration`` class instead, either as the class object or as
+    a string: ``'module:ClassName'`` (the form dev's model loaders declare, and safe to ship through
+    Ray ``engine_args``) or a bare name resolved against ``transformers`` (twinkle's
+    ``TransformersModel.model_cls`` convention).
+    """
+    from transformers import AutoModelForCausalLM
+    if model_cls is None:
+        return AutoModelForCausalLM
+    if isinstance(model_cls, str):
+        if ':' in model_cls:
+            import importlib
+            module_name, _, cls_name = model_cls.partition(':')
+            return getattr(importlib.import_module(module_name), cls_name)
+        import transformers
+        return getattr(transformers, model_cls)
+    return model_cls
+
+
 class TransformersEngine(BaseSamplerEngine):
-    """Wrap a HF causal LM so it satisfies the sampler-engine contract."""
+    """Wrap a HF causal LM (or a vision-language model, via ``model_cls``) so it satisfies the
+    sampler-engine contract."""
 
     def __init__(
         self,
@@ -48,6 +72,7 @@ class TransformersEngine(BaseSamplerEngine):
         max_model_len: Optional[int] = None,
         attn_implementation: Optional[str] = None,
         trust_remote_code: bool = False,
+        model_cls: Any = None,
         model: Any = None,
         tokenizer: Any = None,
         **model_kwargs,
@@ -64,12 +89,16 @@ class TransformersEngine(BaseSamplerEngine):
                 meaningless completion.
             attn_implementation: e.g. ``'flash_attention_2'``, ``'sdpa'``.
             trust_remote_code: Allow custom modelling code from the checkpoint.
+            model_cls: The transformers class to load with (class object, ``'module:ClassName'`` or a
+                bare ``transformers`` name). Defaults to ``AutoModelForCausalLM``; a vision-language
+                checkpoint needs its own ``...ForConditionalGeneration`` class (see
+                :func:`_resolve_model_cls`).
             model: A pre-built model, for callers that already loaded one. Skips ``from_pretrained``.
             tokenizer: A pre-built tokenizer/processor, likewise.
             **model_kwargs: Forwarded to ``from_pretrained``.
         """
         requires('transformers')
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
 
         self.model_id = model_id
         self.max_model_len = max_model_len
@@ -88,6 +117,7 @@ class TransformersEngine(BaseSamplerEngine):
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
         if model is None:
+            model_cls_resolved = _resolve_model_cls(model_cls)
             load_kwargs: Dict[str, Any] = {
                 'dtype': dtype if dtype is not None else 'auto',
                 'trust_remote_code': trust_remote_code,
@@ -96,8 +126,8 @@ class TransformersEngine(BaseSamplerEngine):
             if attn_implementation is not None:
                 load_kwargs['attn_implementation'] = attn_implementation
             load_kwargs['device_map'] = device_map if device_map is not None else torch_util.get_device(None)
-            logger.info(f'TransformersEngine loading {model_id} with {load_kwargs}')
-            model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+            logger.info(f'TransformersEngine loading {model_id} with {model_cls_resolved.__name__} and {load_kwargs}')
+            model = model_cls_resolved.from_pretrained(model_id, **load_kwargs)
         self.model = model
         self.model.eval()
 

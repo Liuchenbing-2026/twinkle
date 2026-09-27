@@ -1139,13 +1139,19 @@ class VLLMEngine(BaseSamplerEngine):
 
         if self.engine is not None:
             try:
-                # vLLM v1 AsyncLLM has shutdown() method
+                # vLLM v1 AsyncLLM has shutdown() method. It is synchronous on vLLM>=0.23 (returns
+                # None) but was a coroutine on older versions, so only await an awaitable result --
+                # blindly awaiting the sync return raises "NoneType can't be used in 'await'".
                 if hasattr(self.engine, 'shutdown'):
-                    await self.engine.shutdown()
+                    result = self.engine.shutdown()
+                    if inspect.isawaitable(result):
+                        await result
                 elif hasattr(self.engine, 'engine_core'):
                     # For older versions, try to stop engine core
                     if hasattr(self.engine.engine_core, 'shutdown'):
-                        await self.engine.engine_core.shutdown()
+                        result = self.engine.engine_core.shutdown()
+                        if inspect.isawaitable(result):
+                            await result
             except Exception as e:
                 logger.warning(f'Error during engine shutdown: {e}')
             finally:

@@ -31,6 +31,8 @@ import threading
 from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
 
+import torch
+
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.data_format import InputFeature, SampledSequence, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
@@ -344,6 +346,9 @@ class TransformersSampler(Sampler):
                    adapter_uri: Optional[str], strict: bool) -> List[SampleResponse]:
         """Generate for one padded batch, falling back to one-at-a-time to isolate a bad input."""
         prompts = [self._prompt_ids(encoded[i]) for i in chunk]
+        # A vision-language model needs the image tensors the template encoded (pixel_values and
+        # friends) alongside the prompt ids; a text-only batch collates to nothing and passes None.
+        extra = self._extra_model_inputs(chunk, encoded)
         try:
             return self._run_in_loop(
                 self.engine.batch_sample(
@@ -352,6 +357,7 @@ class TransformersSampler(Sampler):
                     num_samples=params.num_samples,
                     logprobs=params.logprobs is not None,
                     adapter_uri=adapter_uri,
+                    extra_model_inputs=extra or None,
                 ))
         except Exception as exc:
             if strict or len(chunk) == 1:
@@ -359,16 +365,17 @@ class TransformersSampler(Sampler):
             logger.warning(f'TransformersSampler: batch of {len(chunk)} failed ({exc}); retrying individually '
                            'to isolate the offending input')
             out = []
-            for prompt in prompts:
+            for position, index in enumerate(chunk):
                 try:
                     out.append(
                         self._run_in_loop(
                             self.engine.batch_sample(
-                                [prompt],
+                                [prompts[position]],
                                 params,
                                 num_samples=params.num_samples,
                                 logprobs=params.logprobs is not None,
                                 adapter_uri=adapter_uri,
+                                extra_model_inputs=self._extra_model_inputs([index], encoded) or None,
                             ))[0])
                 except Exception as inner:
                     logger.warning(f'TransformersSampler: input dropped, generate failed: {inner}')
@@ -380,6 +387,25 @@ class TransformersSampler(Sampler):
         if self.template is not None:
             input_ids = self.template.get_vllm_input_ids(input_ids)
         return input_ids.tolist() if hasattr(input_ids, 'tolist') else list(input_ids)
+
+    def _extra_model_inputs(self, chunk: List[int], encoded: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+        """Collate the multimodal tensors the template encoded for ``chunk`` into one batched dict.
+
+        ``encode_trajectory`` keeps every template output key except ``labels`` on the InputFeature, so
+        a vision-language row carries ``pixel_values`` / ``image_grid_thw`` here. HF's processor lays
+        those out flat over a row's images, so batching concatenates along dim 0 -- exactly how one
+        multi-image prompt is shaped for a single ``generate``. ``input_ids`` / ``attention_mask`` are
+        excluded: the engine rebuilds both from the left-padded prompt ids, and an ``attention_mask``
+        passed here would clobber the padding mask. Text-only rows contribute no tensor keys, so a
+        plain batch returns ``{}``.
+        """
+        collected: Dict[str, List[torch.Tensor]] = {}
+        for index in chunk:
+            for key, value in encoded[index].items():
+                if key in ('input_ids', 'attention_mask', 'labels') or not isinstance(value, torch.Tensor):
+                    continue
+                collected.setdefault(key, []).append(value)
+        return {key: torch.cat(values, dim=0) for key, values in collected.items()}
 
     def _attach_features(self, results: List[Optional[SampleResponse]], encoded: Dict[int, Dict[str, Any]]) -> None:
         """Fill in ``new_input_feature`` so downstream training code can consume the samples directly.

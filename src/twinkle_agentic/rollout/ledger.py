@@ -139,16 +139,29 @@ class TurnLedger:
         them. ``tools`` overrides what the trajectory carries, for a caller whose
         executing tool list comes from somewhere else than its prompt (an Env
         that reported its own schemas, say).
+
+        The resolved tools must go INTO this encode, not just be recorded on the
+        feature afterwards. A local template bakes ``input_ids`` here exactly once
+        and the sampler then feeds those ids straight to the engine (its
+        ``is_trajectory`` is False because the feature already carries
+        ``input_ids``, so nothing re-encodes), which means tools written only to
+        ``pif['tools']`` never reach the prompt tokens: the model is never told it
+        can call anything and answers as a plain assistant. Injecting them into
+        the encode input is what makes the chat template render the schemas into
+        the system prompt. The message-level ``MessageLedger`` needs no such step
+        -- it sends ``tools`` to the API separately, and the API reads them off
+        the feature rather than off baked ids.
         """
-        pif = _to_plain(self.template.encode(trajectory, add_generation_prompt=True))
+        resolved_tools = (list(tools) if tools is not None else
+                          (list(trajectory.get('tools') or []) if 'tools' in trajectory else None))
+        encode_input = trajectory if resolved_tools is None else {**trajectory, 'tools': resolved_tools}
+        pif = _to_plain(self.template.encode(encode_input, add_generation_prompt=True))
         # The template is not obliged to echo these back, and every consumer
         # downstream reads the episode off the feature rather than off the
         # trajectory it came from.
         pif.setdefault('messages', list(trajectory.get('messages') or []))
-        if tools is not None:
-            pif['tools'] = list(tools)
-        elif 'tools' in trajectory:
-            pif['tools'] = list(trajectory.get('tools') or [])
+        if resolved_tools is not None:
+            pif['tools'] = resolved_tools
         self._pif = pif
         self._logprobs = []
         self._turns = 0
