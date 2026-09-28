@@ -10,7 +10,7 @@ import asyncio
 import json
 import traceback
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from typing import TYPE_CHECKING
@@ -33,22 +33,47 @@ from twinkle_client.common.json_utils import json_safe
 logger = get_logger()
 
 
+#: Sentinel for a value that cannot cross the HTTP boundary and must be omitted from its container.
+_DROP = object()
+_JSON_PRIMITIVES = (str, int, float, bool, type(None))
+
+
+def _json_safe_value(value):
+    """Recursively convert one InputFeature value into JSON-safe form.
+
+    numpy arrays and torch tensors become nested lists and mappings/sequences are walked, so a media
+    field nested inside ``messages`` is reached too. Anything else that JSON cannot represent -- above
+    all the raw ``PIL.Image`` objects a multimodal encode leaves in ``messages``/``images`` -- is
+    dropped (``_DROP``): the token-level features (``input_ids``/``labels``/``completion_mask``/...) are
+    what a token-in-token-out caller re-feeds, and the client already holds the media it sent, so the
+    un-serializable pixels add nothing to the response and would otherwise fail ``dump_json``.
+    """
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, Mapping):
+        out = {}
+        for key, item in value.items():
+            safe = _json_safe_value(item)
+            if safe is not _DROP:
+                out[key] = safe
+        return out
+    if isinstance(value, (list, tuple)):
+        return [safe for safe in (_json_safe_value(item) for item in value) if safe is not _DROP]
+    if isinstance(value, _JSON_PRIMITIVES):
+        return value
+    tolist = getattr(value, 'tolist', None)
+    if callable(tolist):
+        try:
+            return value.tolist()
+        except Exception:
+            pass
+    return _DROP
+
+
 def _serialize_input_feature(feature: dict) -> dict:
-    """Convert numpy arrays / torch tensors in an InputFeature to plain Python lists."""
-    result = {}
-    for k, v in feature.items():
-        if isinstance(v, np.ndarray):
-            result[k] = v.tolist()
-        else:
-            try:
-                import torch
-                if isinstance(v, torch.Tensor):
-                    result[k] = v.tolist()
-                    continue
-            except ImportError:
-                pass
-            result[k] = v
-    return result
+    """Convert an InputFeature into a JSON-safe dict for the HTTP response."""
+    safe = _json_safe_value(feature)
+    return safe if isinstance(safe, dict) else {}
 
 
 def _get_twinkle_sampler_adapter_name(request: Request, adapter_name: str | None) -> str | None:
@@ -295,7 +320,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
         if not self.data_plane.enabled:
             raise HTTPException(status_code=503, detail='sample_to_data_plane requires data_plane_url')
         if not callable(getattr(self.sampler, 'submit_generation', None)):
-            raise HTTPException(status_code=503, detail='sampler_type must be vllm_async')
+            raise HTTPException(status_code=503, detail='sampler_type must be vllm_async or sglang_async')
 
         adapter_path = None
         full_adapter_name = _get_twinkle_sampler_adapter_name(request, body.adapter_name) or ''

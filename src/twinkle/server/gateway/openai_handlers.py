@@ -9,6 +9,7 @@ Translates OpenAI request/response shapes and proxies to the existing sampler
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import Callable
 from fastapi import Depends, FastAPI, Request
@@ -218,6 +219,7 @@ def _register_openai_routes(app: FastAPI, self_fn: Callable[[], GatewayServer]) 
             models.append({
                 'id': m.model_name,
                 'object': 'model',
+                'created': int(time.time()),
                 'owned_by': self.owned_by,
             })
         return JSONResponse(content={

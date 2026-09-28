@@ -251,7 +251,14 @@ class Template:
             raise ValueError(f'appended_as must be one of {_APPEND_ROLES}, got {appended_as!r}')
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
-        labels = list(result.get('labels', []))
+        labels = list(result.get('labels') or [])
+        if not labels:
+            # A bare token-in-token-out prefix (raw ``input_ids``, no ``labels``) records no provenance:
+            # every prompt token is context the completion continues and none of it is trainable. Default
+            # the prefix labels to -100 so ``_prefix_completion_mask`` derives an all-zero prefix mask of
+            # the prompt's own length (only the appended turn trains), instead of an empty mask that would
+            # misalign every position after the prompt and raise.
+            labels = [-100] * len(prompt_ids)
         input_ids = list(prompt_ids) + new_tokens
         labels = labels[-1:] + labels[:-1]  # roll to input order
         completion_mask = self._prefix_completion_mask(result, labels)
@@ -476,6 +483,15 @@ class Template:
                     if not isinstance(block, dict):
                         continue
                     btype = block.get('type')
+                    # OpenAI vision/audio parts nest the media reference one level down --
+                    # {"type": "image_url", "image_url": {"url": ...}} (likewise video_url/audio_url).
+                    # Unwrap them in place to twinkle's {"type": <media>, "url": ...} so the reference is
+                    # preprocessed into pixels exactly like the native format; left untouched the block
+                    # reaches the chat template as an unknown type and the media is silently dropped.
+                    if btype in ('image_url', 'video_url', 'audio_url'):
+                        payload = block.pop(btype, None) or {}
+                        block['url'] = payload.get('url') if isinstance(payload, dict) else payload
+                        btype = block['type'] = btype[:-4]
                     # Check if block has inline data
                     has_data = any(block.get(k) for k in (btype, 'url', 'path'))
                     if has_data:
