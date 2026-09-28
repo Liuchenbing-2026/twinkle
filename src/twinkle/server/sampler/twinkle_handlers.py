@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 import numpy as np
 
 import twinkle_client.types as types
-from twinkle.data_format import InputFeature, SamplingParams, Trajectory
+from twinkle.data_format import InputFeature, PoolingParams, SamplingParams, Trajectory
 from twinkle.server.telemetry.correlation import MODEL_ID, TOKEN_ID
 from twinkle.server.telemetry.tracing import traced_operation
 from twinkle.server.utils.validation import get_session_id_from_request
@@ -57,6 +57,23 @@ def _get_twinkle_sampler_adapter_name(request: Request, adapter_name: str | None
         return None
     owner_id = get_session_id_from_request(request) or request.state.request_id
     return owner_id + '-' + adapter_name
+
+
+def _coerce_inputs(inputs):
+    """Normalize a request's ``inputs`` into a list of ``InputFeature`` / ``Trajectory``.
+
+    A payload may carry pre-encoded token ids (``input_ids``) or a chat ``messages`` trajectory, as a
+    single dict or a list; the shape of the first entry decides which. The sample, sample_to_data_plane
+    and encode routes all accept exactly this surface, so the branching lives here once.
+    """
+    if isinstance(inputs, list) and inputs:
+        first = inputs[0]
+        if isinstance(first, dict) and 'input_ids' in first:
+            return [InputFeature(**item) for item in inputs]
+        return [Trajectory(**item) for item in inputs]
+    if isinstance(inputs, dict):
+        return [InputFeature(**inputs)] if 'input_ids' in inputs else [Trajectory(**inputs)]
+    return inputs
 
 
 def _build_rollout_rows_and_tags(
@@ -240,18 +257,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
                     self.sampler.load_full_weights_from_path(resolved_uri)
 
             # Parse inputs
-            inputs = body.inputs
-            if isinstance(inputs, list) and inputs:
-                first = inputs[0]
-                if isinstance(first, dict) and 'input_ids' in first:
-                    inputs = [InputFeature(**item) for item in inputs]
-                else:
-                    inputs = [Trajectory(**item) for item in inputs]
-            elif isinstance(inputs, dict):
-                if 'input_ids' in inputs:
-                    inputs = [InputFeature(**inputs)]
-                else:
-                    inputs = [Trajectory(**inputs)]
+            inputs = _coerce_inputs(body.inputs)
 
             # Build sampling params
             params = None
@@ -299,14 +305,7 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             _, adapter_path = checkpoint_manager.parse_adapter_uri(body.adapter_uri)
 
         inputs = (await self.data_plane.get(body.input_ref) if body.input_ref is not None else body.inputs)
-        if isinstance(inputs, list) and inputs:
-            first = inputs[0]
-            if isinstance(first, dict) and 'input_ids' in first:
-                inputs = [InputFeature(**item) for item in inputs]
-            else:
-                inputs = [Trajectory(**item) for item in inputs]
-        elif isinstance(inputs, dict):
-            inputs = [InputFeature(**inputs)] if 'input_ids' in inputs else [Trajectory(**inputs)]
+        inputs = _coerce_inputs(inputs)
 
         params_dict = dict(body.sampling_params or {})
         params_dict['num_samples'] = body.num_samples
@@ -350,6 +349,38 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             tags=tags,
         )
 
+    @app.post('/twinkle/encode')
+    async def encode(
+            request: Request,
+            self: SamplerManagement = Depends(self_fn),
+    ):
+        """Run a pooling forward (embedding / classify) and return the pooled output per input.
+
+        The pooling counterpart of ``/twinkle/sample``: it accepts the same Trajectory / InputFeature
+        ``inputs`` plus a ``pooling_params`` block, calls ``sampler.encode``, and returns one flat float
+        list per input under ``data``. Only a sampler built with a pooling head (vLLM ``runner='pooling'``
+        / SGLang ``is_embedding``) can serve it; a generation-only sampler raises, which ``run_task``
+        surfaces as a 500 rather than returning hidden states that would look like embeddings.
+        """
+        token = await self._on_request_start(request)
+        body = await request.json()
+
+        async def _task():
+            inputs = _coerce_inputs(body.get('inputs'))
+            pooling_params = (PoolingParams.from_dict(body['pooling_params'])
+                              if body.get('pooling_params') else None)
+            adapter_name = _get_twinkle_sampler_adapter_name(request, body.get('adapter_name')) or ''
+            responses = self.sampler.encode(inputs, pooling_params, adapter_name=adapter_name)
+            return {'data': [list(response.data) for response in responses]}
+
+        return await run_task(
+            self.schedule_task_and_wait(
+                _task,
+                token=token,
+                input_tokens=0,
+                task_type='encode',
+            ))
+
     @app.post('/twinkle/unload_adapter_paths')
     async def unload_adapter_paths(
             request: Request,
@@ -376,8 +407,24 @@ def _register_twinkle_sampler_routes(app: FastAPI, self_fn: Callable[[], Sampler
             body: types.SetTemplateRequest,
             self: SamplerManagement = Depends(self_fn),
     ) -> types.SetTemplateResponse:
-        """Set the chat template for encoding Trajectory inputs."""
+        """Set the chat template for encoding Trajectory inputs.
+
+        A deployment that pinned its template at construction (``SamplerArgs.template``) ignores this
+        call: the pinned template was chosen deliberately and the gateway's name-based fallback must
+        not clobber it. The response is still success, so a caller that sets templates lazily is
+        unaffected either way.
+        """
+        if getattr(self, '_template_pinned', False):
+            logger.debug('set_template ignored: this sampler was configured with a pinned template.')
+            return types.SetTemplateResponse()
         extra_kwargs = body.model_extra or {}
+        # Multi-tenant safety: this sampler replica is shared, and set_template mutates a single
+        # self.template (it is not keyed per adapter), so one client's call would otherwise change the
+        # encoding every other client sees. The guard above is what makes this safe: a deployment pins
+        # its template at construction (SamplerArgs.template -> _template_pinned), so this mutable path is
+        # only reachable for a deployment that deliberately did NOT pin one. The supported model is one
+        # fixed template per sampler, set once at construction; a per-adapter/per-LoRA template would need
+        # set_template to key by adapter, which is future work.
         with traced_operation('sampler.set_template'):
             self.sampler.set_template(body.template_cls, **extra_kwargs)
         return types.SetTemplateResponse()

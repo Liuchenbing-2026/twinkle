@@ -27,16 +27,21 @@ class _ArgsBase(BaseModel):
 
 
 class HttpOptions(BaseModel):
-    """HTTP listener settings (host/port).
+    """HTTP listener settings (host/port, optional TLS).
 
     Re-exported from ``server_config`` for convenience and so that
-    ``ServerArgs`` can carry it without importing the aggregate root.
+    ``ServerArgs`` can carry it without importing the aggregate root. The
+    ``ssl_*`` pair is forwarded verbatim to Ray Serve's ``HTTPOptions``; both
+    must be set together to serve HTTPS, and leaving them ``None`` keeps the
+    listener on plain HTTP.
     """
 
     model_config = ConfigDict(extra='forbid')
 
     host: str = 'localhost'
     port: int = 8000
+    ssl_keyfile: str | None = None
+    ssl_certfile: str | None = None
 
 
 # ---------- per-deployment args schemas ------------------------------------ #
@@ -96,7 +101,13 @@ class ModelArgs(_ArgsBase):
 class SamplerArgs(_ArgsBase):
     """Args for the ``sampler`` deployment.
 
-    ``sampler_type`` selects the sampler implementation.
+    ``sampler_type`` selects the sampler implementation. ``template`` optionally
+    pins the chat template at construction time: a dict of ``{'template_cls':
+    <name>, **kwargs}`` handed to ``sampler.set_template`` when the replica
+    starts. Setting it here means the deployment serves with a known template
+    from its first request and is not left to the gateway's name-based fallback
+    (``get_template_for_model``); a pinned template also wins over any later
+    ``/twinkle/set_template`` call. Leave it ``None`` to keep that fallback.
     """
 
     model_id: str
@@ -107,6 +118,7 @@ class SamplerArgs(_ArgsBase):
     engine_args: dict[str, Any] | None = None
     queue_config: TaskQueueConfig = Field(default_factory=TaskQueueConfig)
     data_plane_url: str | None = None
+    template: dict[str, Any] | None = None
 
 
 class ServerStateArgs(_ArgsBase):
@@ -128,12 +140,21 @@ class ServerStateArgs(_ArgsBase):
 
 
 class ServerArgs(_ArgsBase):
-    """Args for the gateway ``server`` deployment."""
+    """Args for the gateway ``server`` deployment.
+
+    ``api_key``, when set, makes the gateway require ``Authorization: Bearer
+    <key>`` on the OpenAI-compatible generation endpoints (chat/completions,
+    completions, embeddings, infer); the health/models endpoints stay open so
+    load balancers can probe them. ``owned_by`` is the ``owned_by`` field the
+    ``/models`` listing reports for every served model.
+    """
 
     server_config: ServerStateArgs = Field(default_factory=ServerStateArgs)
     supported_models: list[Any] | None = None
     http_options: HttpOptions | None = None
     route_prefix: str | None = None
+    api_key: str | None = None
+    owned_by: str = 'twinkle'
 
 
 class ProcessorArgs(_ArgsBase):

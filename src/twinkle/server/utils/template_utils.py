@@ -16,6 +16,11 @@ MODEL_TEMPLATE_MAPPING = {
     'Qwen3.5': 'Qwen3_5Template',
     'Qwen3.6': 'Qwen3_5Template',
     'Qwen3.8': 'Qwen3_5Template',
+    # DeepSeek-V4 uses its own chat markup, so it maps to DeepseekV4Template rather than the default.
+    # Substring match is case-sensitive, so cover the org-prefixed and bare spellings callers use.
+    'DeepSeek-V4': 'DeepseekV4Template',
+    'deepseek-v4': 'DeepseekV4Template',
+    'Deepseek-V4': 'DeepseekV4Template',
     # Add more model-template mappings here as needed
     # 'ModelName': 'TemplateName',
 }
