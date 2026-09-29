@@ -24,6 +24,7 @@ from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
 from twinkle.utils import get_logger
 from twinkle.utils.safetensors import load_state_dict, save_state_dict
+from ..base import ModelLoaderProtocol
 from ..multi_lora import MultiLora
 from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
@@ -82,10 +83,15 @@ class MultiLoraMegatronModel(MegatronModel):
             'variable_seq_lengths': self.variable_seq_lengths,
         })
         seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
-        if config is None:
-            self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
-        else:
+        model_loader: Optional[ModelLoaderProtocol] = kwargs.pop('model_loader', None)
+        if config is not None:
             self.hf_config = config
+        elif model_loader is not None:
+            # Same caller-supplied builder contract as MegatronModel (see ModelLoaderProtocol): only the
+            # config hooks apply on this backend -- mcore builds the module and the bridge loads weights.
+            self.hf_config = model_loader.process_config(model_loader.build_config(self._model_path))
+        else:
+            self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
         self.strategy = MegatronStrategy(
             self._model_path,
             self.device_mesh,

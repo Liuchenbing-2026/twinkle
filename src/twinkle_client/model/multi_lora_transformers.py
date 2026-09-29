@@ -28,7 +28,7 @@ def _data_ref_payload(inputs: DataRef | list[DataRef]) -> dict[str, Any]:
 
 
 class MultiLoraTransformersModel:
-    """Client wrapper for TwinkleModel that calls server HTTP endpoints.
+    """Client wrapper for TrainableModel that calls server HTTP endpoints.
 
     This client manages adapters and sends training/inference requests to the model server.
     The server-side session (managed by TwinkleClient) keeps the model alive.

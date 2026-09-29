@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 from twinkle.utils.import_utils import _LazyModule
 
 if TYPE_CHECKING:
-    from .base import ModelLoaderProtocol, TwinkleModel
+    from .base import ModelLoaderProtocol, TrainableModel
     from .megatron import MegatronModel, MultiLoraMegatronModel
     from .micro_batch import MicroBatchConfig
     from .transformers import (MultiLoraTransformersModel, SpectralHybridTransformersModel, TransformersModel,
@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 else:
     _import_structure = {
-        'base': ['ModelLoaderProtocol', 'TwinkleModel'],
+        'base': ['ModelLoaderProtocol', 'TrainableModel'],
         'micro_batch': ['MicroBatchConfig'],
         'transformers': [
             'TransformersModel', 'MultiLoraTransformersModel', 'SpectralHybridTransformersModel',

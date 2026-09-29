@@ -33,7 +33,7 @@ from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
-from twinkle.model.base import ModelLoaderProtocol, TwinkleModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
@@ -270,7 +270,7 @@ def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
 
 
 @remote_class()
-class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
+class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     """The transformers model wrapper.
 
     Args:

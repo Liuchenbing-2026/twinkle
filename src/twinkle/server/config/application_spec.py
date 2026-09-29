@@ -85,6 +85,7 @@ class ModelArgs(_ArgsBase):
     target_modules: str | list[str] = 'all-linear'
     hybrid: SpectralHybridArgs | None = None
     data_plane_url: str | None = None
+    model_loader: str | None = None
 
     @model_validator(mode='after')
     def _validate_spectral_backend(self):

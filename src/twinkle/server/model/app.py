@@ -7,6 +7,8 @@ both Tinker (/tinker/*) and Twinkle (/twinkle/*) model endpoints.
 """
 from __future__ import annotations
 
+import importlib
+
 from fastapi import FastAPI, Request
 from ray import serve
 from ray.serve.config import RequestRouterConfig
@@ -71,6 +73,22 @@ def _make_megatron_model(kw: dict[str, Any]) -> Any:
     return TwinkleCompatMegatronModel(**kw)
 
 
+def _resolve_model_loader(spec: str, model_id: str) -> Any:
+    """Resolve a ``module:callable`` loader-factory spec and build the loader for ``model_id``.
+
+    The deployment config names the factory as plain data (it crosses the Ray boundary), so it is
+    imported generically here -- twinkle never imports a concrete model registry. swift points this at
+    its own ``swift.dev.model.loader:build_model_loader``, which owns family resolution and returns a
+    ``ModelLoaderProtocol`` object, or ``None`` to keep the generic AutoConfig/AutoModel path.
+    """
+    module_name, _, attr = spec.partition(':')
+    if not attr:
+        raise ValueError(
+            f'model_loader must be a "module:callable" import spec naming a loader factory, got {spec!r}')
+    factory = getattr(importlib.import_module(module_name), attr)
+    return factory(model_id)
+
+
 # Single validate-then-dispatch selector for the model backend.
 MODEL_SELECTOR = BackendSelector(
     'backend',
@@ -119,6 +137,10 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         # constructor never receives it; re-injected into ctor_kwargs so the
         # backend builder can pick the full vs LoRA wrapper class.
         self.train_mode = kwargs.pop('train_mode', 'lora')
+        # ``model_loader`` arrives as an import spec (plain data across the Ray boundary); resolve it to
+        # the loader object here, in the replica, right before construction. ``None`` (unset, or no
+        # family matched) leaves the generic AutoConfig/AutoModel path untouched.
+        model_loader_spec = kwargs.pop('model_loader', None)
 
         ctor_kwargs: dict[str, Any] = {
             'model_id': model_id,
@@ -127,6 +149,8 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             'train_mode': self.train_mode,
             **kwargs,
         }
+        if model_loader_spec is not None:
+            ctor_kwargs['model_loader'] = _resolve_model_loader(model_loader_spec, model_id)
         if self.device_mesh is not None:
             ctor_kwargs['device_mesh'] = self.device_mesh
         self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)

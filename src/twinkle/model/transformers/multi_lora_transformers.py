@@ -17,6 +17,7 @@ from twinkle.infra import collect_tensor_dict
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
+from ..base import ModelLoaderProtocol
 from ..multi_lora import MultiLora
 from .transformers import CHECKPOINT_ADAPTER_NAME, OptimizerGroup, TransformersModel
 
@@ -41,6 +42,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_r: int = 32,
             max_length: int = 8192,
             target_modules: Union[List[str], str] = 'all-linear',
+            model_loader: Optional[ModelLoaderProtocol] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
@@ -58,18 +60,31 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         if model_id is not None:
             model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
-        if config is None:
+        self._default_tokenizer = None
+        if config is not None:
+            self.hf_config = config
+        elif model_loader is not None and model_id is not None:
+            # Caller-supplied loader (see ModelLoaderProtocol) owns construction -- the same seam
+            # TransformersModel uses, so a family that rewrites config/processor/model keeps doing so
+            # under multi-LoRA too instead of falling back to the transformers-namespace default.
+            self.hf_config = model_loader.process_config(model_loader.build_config(model_id))
+        else:
             from transformers import AutoConfig
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        else:
-            self.hf_config = config
         if model_cls is None and hasattr(self.hf_config, 'architectures'):
             model_cls = self.hf_config.architectures[0]
         if model_cls is None:
             model_cls = AutoModelForCausalLM
         if isinstance(model_cls, str):
             model_cls = getattr(transformers, model_cls)
-        if model_id is None:
+        if model_loader is not None and model_id is not None:
+            processor = model_loader.process_tokenizer(model_loader.build_processor(model_id, self.hf_config))
+            self._default_tokenizer = processor
+            load_kwargs = {**kwargs, **self.strategy.init_kwargs()}
+            with self.strategy.pretrained_load_context():
+                model = model_loader.build_model(model_id, config=self.hf_config, processor=processor, **load_kwargs)
+            self.model = model_loader.process_model(model)
+        elif model_id is None:
             self.model = model_cls.from_config(self.hf_config, **kwargs)
         elif self._should_init_empty_pretrained_model_on_this_rank():
             self.model = self._init_empty_model_from_config(model_cls, **kwargs)
@@ -78,7 +93,6 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             with self.strategy.pretrained_load_context():
                 self.model = model_cls.from_pretrained(model_id, config=self.hf_config, **kwargs)
         self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
-        self._default_tokenizer = None
         self._model_wrapped = False
         self.sp_strategy = None
         # Initialize expert parallel attributes (required by set_optimizer in TransformersModel)

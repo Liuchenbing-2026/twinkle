@@ -31,7 +31,7 @@ from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
-from twinkle.model.base import ModelLoaderProtocol, TwinkleModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
@@ -105,7 +105,7 @@ _default_adapter_name = ''
 
 
 @remote_class(execute='all')
-class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
+class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
     def __init__(
         self,

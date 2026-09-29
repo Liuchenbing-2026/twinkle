@@ -88,7 +88,7 @@ class ModelLoaderProtocol(Protocol):
         ...
 
 
-class TwinkleModel(ABC):
+class TrainableModel(ABC):
 
     _checkpoint_engine = None
 
