@@ -288,12 +288,34 @@ class SamplerModelAPI(_BaseModelAPI):
         super().__init__(model_id, explicit_generation_keys)
         self.sampler = sampler
         self.template = template
-        self.batcher = SamplerBatcher(
+        self.sampler_kwargs = dict(sampler_kwargs)
+        # A continuous-work sampler (vLLM/SGLang) batches concurrently-submitted requests inside its own
+        # engine, so EvalScope's per-sample concurrency should reach it as one sample() call per trajectory
+        # on the calling thread: each call returns the moment its own sequence finishes, with no
+        # head-of-line blocking against the longest sequence of a coalesced batch, and the engine never
+        # drains between batches. The single-worker batcher would serialize those calls (it blocks on each
+        # sample()), so it is kept only for a sampler that does not continuous-batch (transformers), where
+        # coalescing equal requests into one physical batch is what forms a batch at all.
+        # The flag lives on the class-level wrapper (set by twinkle's remote_function), so read it from
+        # type(sampler).sample exactly as the rollout guards do -- not from the bound instance method.
+        sample = getattr(type(sampler), 'sample', None)
+        self.continuous = bool(getattr(sample, '_enable_continous_work', False))
+        self.batcher = None if self.continuous else SamplerBatcher(
             sampler, batch_size=batch_size, batch_wait_ms=batch_wait_ms, sampler_kwargs=sampler_kwargs)
 
     def validate_generation_config(self, config: GenerateConfig) -> None:
         self._validate_common(config, _COMMON_FIELDS)
         self._sampling_params(config)
+
+    def _submit(self, trajectory: dict[str, Any], sampling_params: SamplingParams) -> Any:
+        """Sample one trajectory: straight to the engine when it continuous-batches, else via the batcher."""
+        if self.batcher is not None:
+            return self.batcher.submit(trajectory, sampling_params)
+        responses = self.sampler.sample([trajectory], sampling_params=sampling_params, **self.sampler_kwargs)
+        if not isinstance(responses, Sequence) or len(responses) != 1:
+            raise BackendContractError(
+                f'Sampler for {self.model_name} returned {responses!r} for a single-trajectory request')
+        return responses[0]
 
     def generate(self, input: list[Any], tools: list[Any], tool_choice: Any, config: GenerateConfig) -> ModelOutput:
         self.validate_generation_config(config)
@@ -304,7 +326,7 @@ class SamplerModelAPI(_BaseModelAPI):
         request_id = self._next_request_id()
         trajectory = to_twinkle_trajectory(input, tools, include_tools=tool_choice != 'none')
         started = monotonic()
-        response = self.batcher.submit(trajectory, self._sampling_params(config))
+        response = self._submit(trajectory, self._sampling_params(config))
         elapsed = monotonic() - started
         sequences = read_value(response, 'sequences')
         if not isinstance(sequences, Sequence) or not sequences:

@@ -3,7 +3,7 @@ import os
 import re
 import shutil
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Protocol, Type, Union
 
 from twinkle import Platform, torch_util
 from twinkle.data_format import InputFeature, ModelOutput
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     import torch
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
+    from transformers import PreTrainedModel, PretrainedConfig
 
 
 def copy_checkpoint_args(output_dir: str, checkpoint_dir: str) -> None:
@@ -48,6 +49,43 @@ def rotate_checkpoints(output_dir: str, current_checkpoint_dir: str, save_total_
     checkpoints.sort()
     for _, _, _, checkpoint_path in checkpoints[:-save_total_limit]:
         shutil.rmtree(checkpoint_path)
+
+
+class ModelLoaderProtocol(Protocol):
+    """The construction hooks twinkle's model backends call on a caller-supplied ``model_loader``.
+
+    A backend hands checkpoint construction back to the caller by accepting a ``model_loader``. The
+    transformers backend calls all six hooks (build config -> processor -> model, each paired with a
+    ``process_*`` post-hook); the megatron backend calls only ``build_config`` / ``process_config``
+    (mcore builds the module itself and the bridge loads the weights). This Protocol names exactly that
+    consumer-defined surface -- and nothing more -- so the seam is type-checked instead of duck-typed
+    ``Any``, and a misspelled hook is caught statically rather than at load time.
+
+    It is a structural contract, deliberately NOT a base class: twinkle never imports the concrete
+    loader and never ``isinstance``-checks it, so the dependency stays one-directional (caller ->
+    twinkle). swift/dev's ``ModelLoader`` -- the family-registry base, which additionally carries
+    ``model_arch`` / ``model_info`` / registration metadata that twinkle does not consume -- satisfies
+    this Protocol structurally without inheriting it.
+    """
+
+    def build_config(self, model_dir: str, **kwargs) -> 'PretrainedConfig':
+        ...
+
+    def process_config(self, config: 'PretrainedConfig') -> 'PretrainedConfig':
+        ...
+
+    def build_processor(self, model_dir: str, config: 'PretrainedConfig', **kwargs) -> Any:
+        ...
+
+    def process_tokenizer(self, tokenizer: Any) -> Any:
+        ...
+
+    def build_model(self, model_dir: str, config: 'PretrainedConfig', processor: Any,
+                    **kwargs) -> 'PreTrainedModel':
+        ...
+
+    def process_model(self, model: 'PreTrainedModel') -> 'PreTrainedModel':
+        ...
 
 
 class TwinkleModel(ABC):

@@ -33,7 +33,7 @@ from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
-from twinkle.model.base import TwinkleModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import ModelLoaderProtocol, TwinkleModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.micro_batch import MicroBatchConfig, plan_micro_batches, select_batch
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.model.transformers.moe import apply_expert_parallel
@@ -309,7 +309,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             grad_scaler_config: Dict[str, Any] = None,
             memory_efficient_init: bool = False,
             deepspeed_config: Dict[str, Any] = None,
-            model_loader: Optional[Any] = None,
+            model_loader: Optional[ModelLoaderProtocol] = None,
             **kwargs):
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         # Opt-out of the cuDNN SDPA backend (falls back to flash/mem-efficient, numerically
@@ -337,8 +337,8 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         if config is not None:
             self.hf_config = config
         elif model_loader is not None and model_id is not None:
-            # A caller-supplied loader (duck-typed: build_config/build_processor/build_model +
-            # process_* hooks -- dev's ModelLoader) owns construction. It reads the config off the
+            # A caller-supplied loader (see ModelLoaderProtocol: build_config/build_processor/build_model
+            # + process_* hooks -- dev's ModelLoader) owns construction. It reads the config off the
             # downloaded dir and may rewrite it (process_config), e.g. to flip remote-code flags.
             self.hf_config = model_loader.process_config(model_loader.build_config(model_id))
         else:

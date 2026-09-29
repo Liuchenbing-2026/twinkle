@@ -31,7 +31,7 @@ from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import LossMetric, Metric, TrainMetric
-from twinkle.model.base import TwinkleModel, copy_checkpoint_args, rotate_checkpoints
+from twinkle.model.base import ModelLoaderProtocol, TwinkleModel, copy_checkpoint_args, rotate_checkpoints
 from twinkle.model.optimizer_group import BaseOptimizerGroup, TrainStatus
 from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.processor import InputProcessor
@@ -161,12 +161,12 @@ class MegatronModel(TwinkleModel, nn.Module, CheckpointEngineMixin):
             'variable_seq_lengths': self.variable_seq_lengths,
         })
         seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
-        model_loader = kwargs.pop('model_loader', None)
+        model_loader: Optional[ModelLoaderProtocol] = kwargs.pop('model_loader', None)
         if config is not None:
             self.hf_config = config
         elif model_loader is not None:
-            # Same caller-supplied builder contract as TransformersModel: a duck-typed loader
-            # (build_config + process_config -- dev's ModelLoader) owns the HF config, so a family
+            # Same caller-supplied builder contract as TransformersModel (see ModelLoaderProtocol): a
+            # loader (build_config + process_config -- dev's ModelLoader) owns the HF config, so a family
             # that rewrites it keeps doing so on this backend too. Only the config hooks apply here;
             # mcore builds the module itself, and weights come from bridge.load_weights below.
             self.hf_config = model_loader.process_config(model_loader.build_config(self._model_path))
