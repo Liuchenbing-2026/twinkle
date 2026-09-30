@@ -417,6 +417,30 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         """
         return self.forward_backward(inputs=inputs, micro_batch_size=micro_batch_size, forward_only=True, **kwargs)
 
+    def generate(self, *args, **kwargs):
+        """Refuse in-place generation rather than approximate it.
+
+        A ``TransformersSampler`` facade forwards ``generate`` to the model it wraps. That is sound for a
+        ``TransformersModel`` whose weights an inference engine can read, but not here: Megatron keeps
+        weights sharded across TP/PP ranks under Megatron's own parameter names, a layout no sampling
+        engine understands. Failing loudly beats silently generating from a partial, renamed view.
+        """
+        raise NotImplementedError(
+            'MegatronModel cannot generate in place: its weights are sharded across TP/PP ranks under '
+            'Megatron parameter names, which no inference engine reads. Use a dedicated sampler '
+            '(vLLM/SGLang/Transformers) that loads its own copy of the weights.')
+
+    def generate_stream(self, *args, **kwargs):
+        """Streaming counterpart of :meth:`generate`, refused for the same reason.
+
+        Deliberately a plain method rather than a generator function: the refusal must fire when the method
+        is called, not only when a returned iterator is consumed, so a facade surfaces it at the call site.
+        """
+        raise NotImplementedError(
+            'MegatronModel cannot generate in place: its weights are sharded across TP/PP ranks under '
+            'Megatron parameter names, which no inference engine reads. Use a dedicated sampler '
+            '(vLLM/SGLang/Transformers) that loads its own copy of the weights.')
+
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
         raise NotImplementedError('Megatron only supports `forward_backward` and `forward_only`')

@@ -181,7 +181,7 @@ class LigerFusedLinearCrossEntropyLoss(Loss):
                 weight = weight.full_tensor()
             try:
                 loss = self._liger(weight, hidden_flat, labels_flat)
-            except Exception:  # defensive, device-agnostic
+            except Exception as e:  # defensive, device-agnostic
                 if not self._warned:
                     self._warned = True
                     logger.warning(
