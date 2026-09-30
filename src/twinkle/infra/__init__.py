@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
 
 from twinkle.notifier import Notifier, notify_exception
 from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, framework_util, get_logger, requires
-from .collectors import collect_tensor_dict
+from .collectors import collect_dp_and_flatten, collect_tensor_dict
 
 logger = get_logger()
 

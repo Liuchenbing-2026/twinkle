@@ -28,9 +28,9 @@ import twinkle.module.scheduler
 from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
-from twinkle.data_format import InputFeature, ModelOutput, Trajectory
+from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
-from twinkle.infra import collect_tensor_dict
+from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
 from twinkle.loss import CrossEntropyLoss, Loss
 from twinkle.metric import Accuracy, LossMetric, Metric, TrainMetric
 from twinkle.model.base import ModelLoaderProtocol, TrainableModel, copy_checkpoint_args, rotate_checkpoints
@@ -228,6 +228,9 @@ class OptimizerGroup(BaseOptimizerGroup):
 _default_adapter_name = ''
 DEFAULT_LEARNING_RATE = 1e-5
 DEFAULT_WEIGHT_DECAY = 0.01
+# How many prompts go into one padded generate() during an in-model rollout. Matches the transformers
+# sampler's default; larger is faster until the padding waste from mixed prompt lengths outweighs it.
+_GENERATION_MAX_BATCH_SIZE = 8
 
 
 def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
@@ -861,6 +864,147 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             if recorded_routing is not None:
                 return_outputs['routed_experts'] = recorded_routing
             return return_outputs
+
+    @remote_function(dispatch='slice_dp', collect=collect_dp_and_flatten, lazy_collect=False)
+    def generate(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        return_encoded: bool = False,
+        use_base_model: bool = False,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+        strict: bool = True,
+    ) -> List[SampleResponse]:
+        """Generate completions on the weights this model already holds, inside its own workers.
+
+        This is the target a :class:`~twinkle.sampler.TransformersSampler` facade forwards to when it is
+        built with ``model=<TransformersModel>`` instead of ``model_id``. The point is to sample during
+        training without a second copy of the model and without a weight sync: there is only ever one set
+        of weights, these, so a ``TransformersEngine`` is wrapped around them per call and runs
+        ``generate()`` in place. Unlike :meth:`MegatronModel.generate`, which refuses because Megatron
+        shards weights under its own parameter names, a transformers model keeps a layout
+        ``AutoModelForCausalLM.generate`` reads directly -- so in-place generation is sound here.
+
+        Distribution. ``dispatch='slice_dp'`` splits ``inputs`` across data ranks, so each worker only
+        generates for its own shard; ``collect=collect_dp_and_flatten`` then deduplicates the ranks that
+        share one data shard (TP / PP / ulysses peers produce the same result) and flattens the per-worker
+        lists back into one, in input order. A single-GPU or FSDP model is the degenerate case: one data
+        rank, nothing to dedup. ``inputs`` must therefore be a *list* -- a bare ``Trajectory`` dict would
+        be recursed into by the slicing and its ``messages`` split across ranks. The facade normalizes to
+        a list before forwarding; direct callers must too.
+
+        Args:
+            inputs: A list of encoded ``InputFeature`` rows, or of ``Trajectory`` rows to encode first
+                (which requires ``set_template`` to have been called, since the engine also needs the
+                template's tokenizer to left-pad prompts and decode completions).
+            sampling_params: A ``SamplingParams`` or a dict for ``SamplingParams.from_dict``.
+                ``max_tokens == 0`` means score-only, matching the vLLM backend and
+                :meth:`TransformersSampler.sample`: one token is generated and discarded so the prompt
+                gets its logprobs.
+            adapter_name: Selects the optimizer group / template to encode with, exactly as
+                :meth:`forward_only` does. Defaults to the only group, else the active one.
+            adapter_path: Rejected. See below.
+            return_encoded: Accepted for signature parity with the sampler; the encoded feature is always
+                attached to each sequence as ``new_input_feature``, so there is nothing extra to return.
+            use_base_model: Ignore the active peft adapter for this call, generating from the base weights
+                (via ``disable_adapter()``, the same mechanism ``forward_only``'s ``disable_lora`` uses).
+            adapter_paths: Rejected. See below.
+            strict: When False, an input that fails to encode or generate yields an empty ``SampleResponse``
+                with ``stop_reason='error'`` instead of aborting the batch, preserving positions so one bad
+                row cannot discard a long rollout.
+
+        Returns:
+            One ``SampleResponse`` per input, in input order, each holding ``num_samples`` sequences.
+        """
+        # Deferred: the model package must not import the sampler package at module load (it would be a
+        # cycle), and both are only needed once generation is actually requested.
+        from twinkle.sampler import generation
+        from twinkle.sampler.transformers_sampler.transformers_engine import TransformersEngine
+
+        if adapter_path is not None or adapter_paths is not None:
+            # A training model's weights are live; loading an external adapter from disk onto it would
+            # wrap it in a second PeftModel and pollute the model under training. Sample the weights as
+            # they are (or their base, via use_base_model); use a TransformersSampler(model_id=...) with
+            # adapter_path to generate from a separate on-disk adapter.
+            raise NotImplementedError(
+                'TransformersModel.generate samples the weights this model already holds; it cannot load '
+                'an external adapter_path on top of a live training model. Drop adapter_path/adapter_paths '
+                'to sample the current (or, with use_base_model=True, the base) weights, or use a '
+                'TransformersSampler(model_id=...) for a separate adapter.')
+
+        adapter_name = adapter_name or self._get_default_group()
+        template = self.optimizer_group[adapter_name].template
+        if template is None:
+            raise ValueError('Set a template with set_template() before generate(): a Trajectory input '
+                             'needs it to encode, and the engine needs its tokenizer to pad and decode.')
+        inputs_list = [inputs] if isinstance(inputs, dict) else list(inputs)
+        if not inputs_list:
+            return []
+        if isinstance(sampling_params, dict):
+            params = SamplingParams.from_dict(sampling_params)
+        elif sampling_params is None:
+            params = SamplingParams()
+        else:
+            params = sampling_params
+        logprobs_only = params.max_tokens == 0
+        if logprobs_only:
+            params = copy(params)
+            params.max_tokens = 1
+
+        self._lazy_wrap_model()
+        self.model.eval()
+        unwrapped_model = self.strategy.unwrap_model(self.model)
+        # FSDP2 fully_shard is in place, so self.model still exposes .generate and its all-gather hooks
+        # must run -- generate on the wrapped model. A DDP/DeepSpeed wrapper has no .generate, so fall
+        # back to the unwrapped module (the wrapper only exists for gradient sync, irrelevant here).
+        generation_target = self.model if hasattr(self.model, 'generate') else unwrapped_model
+        engine = TransformersEngine(self.tokenizer_id, model=generation_target, tokenizer=template.tokenizer)
+
+        encoded, failures = generation.encode_all(template, inputs_list, logprobs_only=logprobs_only, strict=strict)
+        results: List[Optional[SampleResponse]] = [None] * len(inputs_list)
+        for index, response in failures.items():
+            results[index] = response
+        pending = [index for index in range(len(inputs_list)) if results[index] is None]
+
+        def call_batch(prompts, extra):
+            # The engine's synchronous core, driven inline: this worker has no event loop to keep
+            # responsive and Ray forbids asyncio.run, so there is nothing to gain from batch_sample's
+            # loop-and-thread hop (and its lock, which would be bound to the wrong loop).
+            return engine.generate_batch(
+                prompts, params, num_samples=params.num_samples, logprobs=params.logprobs is not None,
+                extra_model_inputs=extra or None)
+
+        lora_ctx = (unwrapped_model.disable_adapter()
+                    if use_base_model and isinstance(unwrapped_model, PeftModel) else contextlib.nullcontext())
+        with lora_ctx:
+            for chunk in generation.chunks(pending, _GENERATION_MAX_BATCH_SIZE):
+                for index, response in zip(
+                        chunk, generation.run_chunk(chunk, encoded, params, template, call_batch, strict=strict)):
+                    results[index] = response
+
+        if not logprobs_only:
+            generation.attach_features(template, results, encoded)
+        return [
+            r if r is not None else generation.error_response(encoded.get(i, {})) for i, r in enumerate(results)
+        ]
+
+    def generate_stream(self, *args, **kwargs):
+        """Refuse streaming in-place generation rather than half-build it.
+
+        The streaming counterpart of :meth:`generate`, and the target a facade's ``sample_stream``
+        forwards to. Batch generation slices cleanly across data-parallel workers and collects once;
+        streaming would have to merge per-rank token streams back through the same remote boundary in
+        lockstep, which is not something to approximate. Deliberately a plain method, not a generator
+        function, so the refusal fires at the call site instead of only when a returned iterator is
+        consumed -- the same choice :meth:`MegatronModel.generate_stream` makes.
+        """
+        raise NotImplementedError(
+            'TransformersModel.generate does not stream: generation is sliced across data-parallel '
+            'workers and collected as a batch. Call generate() for the whole completion, or use a '
+            'TransformersSampler(model_id=...) whose sample_stream runs on a single engine.')
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):

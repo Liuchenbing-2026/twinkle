@@ -164,6 +164,45 @@ class TransformersEngine(BaseSamplerEngine):
         )
         return responses[0]
 
+    def generate_batch(
+        self,
+        prompt_token_ids: Sequence[List[int]],
+        sampling_params: Optional[SamplingParams] = None,
+        *,
+        num_samples: int = 1,
+        logprobs: bool = True,
+        include_prompt_logprobs: bool = False,
+        topk_prompt_logprobs: int = 0,
+        adapter_uri: Optional[str] = None,
+        extra_model_inputs: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> List[SampleResponse]:
+        """Generate for several prompts in one padded forward, synchronously.
+
+        The blocking core behind :meth:`batch_sample`. A caller with no event loop to keep responsive --
+        a training model's worker generating inline (see ``TransformersModel.generate``) -- drives this
+        directly rather than paying for a loop and a thread hop it has no use for.
+
+        ``extra_model_inputs`` carries the already-processed multimodal tensors (``pixel_values`` and
+        friends). Unlike vLLM, this engine cannot accept raw images -- the template's processor has to
+        run first -- which is the contract note in ``BaseSamplerEngine.sample``.
+        """
+        if not prompt_token_ids:
+            return []
+        params = sampling_params or SamplingParams()
+        self._check_lengths(prompt_token_ids, params)
+        self._activate_adapter(adapter_uri)
+        return self._generate_batch(
+            list(prompt_token_ids),
+            params,
+            num_samples,
+            logprobs,
+            include_prompt_logprobs,
+            topk_prompt_logprobs,
+            extra_model_inputs or {},
+            kwargs,
+        )
+
     async def batch_sample(
         self,
         prompt_token_ids: Sequence[List[int]],
@@ -177,35 +216,27 @@ class TransformersEngine(BaseSamplerEngine):
         extra_model_inputs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> List[SampleResponse]:
-        """Generate for several prompts in one padded forward.
+        """Async :meth:`generate_batch`: serialized behind a lock and run off the caller's event loop.
 
         Not part of :class:`BaseSamplerEngine`, but the reason this engine is usable at all: routing
         every prompt through :meth:`sample` would serialize them behind :attr:`_generate_lock` and
-        give up the only batching transformers has.
-
-        ``extra_model_inputs`` carries the already-processed multimodal tensors (``pixel_values`` and
-        friends). Unlike vLLM, this engine cannot accept raw images -- the template's processor has to
-        run first -- which is the contract note in ``BaseSamplerEngine.sample``.
+        give up the only batching transformers has. The lock turns concurrent callers into a queue
+        instead of a corrupted forward (a single nn.Module cannot run two generate loops at once), and
+        off-loading the blocking generate keeps the caller's loop responsive (the deploy recipe streams
+        other requests on it).
         """
-        if not prompt_token_ids:
-            return []
-        params = sampling_params or SamplingParams()
-        self._check_lengths(prompt_token_ids, params)
-
         async with self._generate_lock:
-            self._activate_adapter(adapter_uri)
-            # generate() is blocking and GPU-bound; off-loading it keeps the caller's event loop
-            # responsive (the deploy recipe streams other requests on it).
             return await asyncio.to_thread(
-                self._generate_batch,
-                list(prompt_token_ids),
-                params,
-                num_samples,
-                logprobs,
-                include_prompt_logprobs,
-                topk_prompt_logprobs,
-                extra_model_inputs or {},
-                kwargs,
+                self.generate_batch,
+                prompt_token_ids,
+                sampling_params,
+                num_samples=num_samples,
+                logprobs=logprobs,
+                include_prompt_logprobs=include_prompt_logprobs,
+                topk_prompt_logprobs=topk_prompt_logprobs,
+                adapter_uri=adapter_uri,
+                extra_model_inputs=extra_model_inputs,
+                **kwargs,
             )
 
     async def generate_stream(

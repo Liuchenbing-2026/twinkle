@@ -8,6 +8,7 @@ from twinkle import remote_function
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampleResponse, SamplingParams,
                                  Trajectory)
 from twinkle.patch import Patch
+from twinkle.sampler import generation
 from twinkle.template import Template
 from twinkle.utils import construct_class
 
@@ -76,10 +77,10 @@ class Sampler(ABC):
     def _not_encoded(inputs: Any) -> bool:
         """Check if inputs are not yet encoded (i.e., is Trajectory, not InputFeature).
 
-        Aligned with TransformersModel._not_encoded for consistency.
+        Shared with ``TransformersModel`` via :func:`twinkle.sampler.generation.not_encoded` so every
+        caller agrees on where the encode boundary is.
         """
-        assert isinstance(inputs, dict), f'Expected dict, got {type(inputs)}'
-        return 'input_ids' not in inputs and 'input_embedding' not in inputs
+        return generation.not_encoded(inputs)
 
     def _is_trajectory(self, inputs: Any) -> bool:
         """Check if inputs are Trajectory type (not encoded)."""
@@ -100,25 +101,9 @@ class Sampler(ABC):
                           trajectory: Trajectory,
                           adapter_name: str = '',
                           add_generation_prompt: bool = True) -> InputFeature:
-        template = self.template
-        if template is None:
+        if self.template is None:
             raise ValueError(f"Template not set for adapter '{adapter_name}'. Use set_template() first.")
-
-        encoded = template.encode(trajectory, add_generation_prompt=add_generation_prompt)
-
-        input_ids = encoded.get('input_ids')
-        if input_ids is None:
-            raise ValueError("Template.encode() must return 'input_ids'")
-        if hasattr(input_ids, 'tolist'):
-            input_ids = input_ids.tolist()
-
-        result = InputFeature(input_ids=input_ids)
-
-        for key, value in encoded.items():
-            if key not in ('input_ids', 'labels'):
-                result[key] = value
-
-        return result
+        return generation.encode_trajectory(self.template, trajectory, add_generation_prompt)
 
     def decode_response(self, token_ids: List[int], adapter_name: str = '') -> str:
         """Decode token ids to text."""
