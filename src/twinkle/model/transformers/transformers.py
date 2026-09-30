@@ -1463,7 +1463,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         Args:
             optimizer_cls: An optimizer class name, an optimizer plugin id, or an optimizer class type/instance.
                 Besides `torch.optim` optimizers, the GaLore optimizers (`GaLoreAdamW`, `GaLoreAdafactor`,
-                `GaLoreAdamW8bit`) and `MuonClip` in `twinkle.module.optimizer` are supported.
+                `GaLoreAdamW8bit`, `QGaLoreAdamW8bit`) and `MuonClip` in `twinkle.module.optimizer` are supported.
             **kwargs:
                 adapter_name: Lora adapter name.
                 lr: Learning rate

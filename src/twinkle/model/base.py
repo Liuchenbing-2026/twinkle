@@ -212,6 +212,38 @@ class TrainableModel(ABC):
         else:
             HubOperation.push_to_hub(repo_id=hub_model_id, folder_path=checkpoint_dir, token=hub_token, private=True)
 
+    def offload_to_cpu(self) -> None:
+        """Hand this rank's training memory back so a colocated process can use the device.
+
+        Colocation -- an online-RL rollout engine, or an in-training generative-eval sampler, sharing
+        the trainer's GPU -- cannot fit both at once, so the trainer steps aside between steps and
+        :meth:`reload_to_gpu` brings it back. The device work is the strategy's: only it knows where
+        this backend keeps the parameters (Megatron pools them into flat per-bucket buffers; the
+        transformers backends hold them on the wrapped module), and an offload that moved the wrong
+        object would report success while freeing nothing. The optimizer state travels with them -- it
+        dwarfs the weight bytes, so offloading the weights alone would reclaim almost nothing.
+
+        This is the driver-facing handle over ``strategy.offload_to_cpu(model, optimizer)``; both
+        concrete models carry the ``strategy`` / ``model`` / ``optimizer_group`` / ``_get_default_group``
+        shape it reads. A strategy with no offload of its own (deepspeed, native FSDP -- whose sharded
+        parameters need backend-specific handling, not a plain move) leaves nothing to delegate to.
+        """
+        self.strategy.offload_to_cpu(self.model, self._colocation_optimizer())
+
+    def reload_to_gpu(self) -> None:
+        """Bring back what :meth:`offload_to_cpu` released, to the device it was moved off."""
+        self.strategy.reload_to_gpu(self.model, self._colocation_optimizer())
+
+    def _colocation_optimizer(self) -> Optional['Optimizer']:
+        """The default group's optimizer, or None before one exists.
+
+        Resolved through the group on every call rather than cached: a model offloaded before its
+        optimizer is built -- a frozen reference model, or the rollout phase of a colocated step --
+        offloads its weights alone and returns None here instead of raising on a missing optimizer.
+        """
+        group = self.optimizer_group.get(self._get_default_group())
+        return group.optimizer if group is not None else None
+
     def _should_bind_device_id_for_process_group(self, backend: str) -> bool:
         return backend in ('nccl', 'hccl')
 
