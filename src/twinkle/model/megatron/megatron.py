@@ -119,6 +119,13 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         recompute_method: Optional[str] = 'uniform',
         recompute_num_layers: Optional[int] = 1,
         recompute_modules: Optional[list] = None,  # Modules to recompute
+        # Forwarded verbatim to MegatronStrategy, which owns them. Declared explicitly (rather than
+        # left in **kwargs) because they are the supported construction surface, and bridge_backend
+        # in particular must stay a NAME string so it survives the Ray worker boundary.
+        bridge_backend='mcore-bridge',
+        align_grad_reduce: bool = True,
+        nccl_comm_warmup: bool = False,
+        attn_impl: Optional[str] = None,
         **kwargs,
     ):
         requires('megatron_core')
@@ -181,6 +188,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             ddp_config=ddp_config or {},
             seed=seed,
             use_distributed_optimizer=self.use_distributed_optimizer,
+            bridge_backend=bridge_backend,
+            align_grad_reduce=align_grad_reduce,
+            nccl_comm_warmup=nccl_comm_warmup,
+            attn_impl=attn_impl,
             **kwargs)
         self.model: List[nn.Module] = self.strategy.create_megatron_model(load_weights)
 
@@ -232,8 +243,24 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
     @staticmethod
     def _not_encoded(inputs):
+        # A packed batch arrives as list[list[InputFeature]]: PackingDataset yields a list of encoded rows
+        # per item and the processor flattens it only later (prepare_inputs), after this probe has run.
+        # Descend to the first leaf dict so the probe reads a packed batch's encoding state instead of
+        # asserting on the intermediate list; for a flat dict / list[dict] the loop is a no-op.
+        while isinstance(inputs, (list, tuple)):
+            if not inputs:
+                return False
+            inputs = inputs[0]
         assert isinstance(inputs, dict)
-        return 'input_ids' not in inputs and 'input_embedding' not in inputs
+        # A row is encoded once it carries ANY tokenized field, not only a bare `input_ids`. Embedding /
+        # reranker rows are GROUP-shaped: one row holds an anchor plus its candidates under prefixed keys
+        # (`anchor_input_ids`, `positive_input_ids`, `negative0_input_ids`, ...) and the processor splits
+        # it into flat per-sequence rows later (prepare_inputs). A raw Trajectory never carries a
+        # `*input_ids` key (it has `messages` + media), so keying on the suffix distinguishes the two
+        # without a bare-`input_ids`-only probe misreading a group row as raw and re-encoding it.
+        return not any(
+            k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
+            for k in inputs)
 
     @staticmethod
     def _slice_value_for_microbatch(value, mb_start: int, mb_end: int, micro_batch_size: int):
@@ -1395,7 +1422,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
     ):
         from megatron.core import dist_checkpointing
         from megatron.core import parallel_state as mpu
-        from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
+        from megatron.core.dist_checkpointing.serialization import TorchDistSaveShardedStrategy
         from megatron.core.dist_checkpointing.strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 
         iteration = optimizer_config.cur_step
@@ -1425,7 +1452,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         # thread_count is stored on the strategy and only read at save time, so setting it post-construction
         # is safe and avoids monkey-patching. Non-torch_dist backends won't expose it and are skipped.
         thread_count = kwargs.pop('thread_count', 2)
-        save_strategy = get_default_save_sharded_strategy()
+        # megatron-core < 0.19 exposed get_default_save_sharded_strategy(); 0.19 removed it and made
+        # dist_checkpointing.save(sharded_strategy=None) default to TorchDistSaveShardedStrategy() itself.
+        # Build that same default explicitly -- the thread_count tweak and the FullyParallel wrap below
+        # both need a concrete strategy instance rather than save()'s implicit None.
+        save_strategy = TorchDistSaveShardedStrategy()
         if hasattr(save_strategy, 'thread_count'):
             save_strategy.thread_count = thread_count
         if mpu.get_data_parallel_world_size(with_context_parallel=True) > 1:

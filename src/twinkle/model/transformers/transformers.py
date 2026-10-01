@@ -478,8 +478,24 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
     @staticmethod
     def _not_encoded(inputs):
+        # A packed batch arrives as list[list[InputFeature]]: PackingDataset yields a list of encoded rows
+        # per item and the processor flattens it only later (prepare_inputs), after this probe has run.
+        # Descend to the first leaf dict so the probe reads a packed batch's encoding state instead of
+        # asserting on the intermediate list; for a flat dict / list[dict] the loop is a no-op.
+        while isinstance(inputs, (list, tuple)):
+            if not inputs:
+                return False
+            inputs = inputs[0]
         assert isinstance(inputs, dict)
-        return 'input_ids' not in inputs and 'input_embedding' not in inputs
+        # A row is encoded once it carries ANY tokenized field, not only a bare `input_ids`. Embedding /
+        # reranker rows are GROUP-shaped: one row holds an anchor plus its candidates under prefixed keys
+        # (`anchor_input_ids`, `positive_input_ids`, `negative0_input_ids`, ...) and the processor splits
+        # it into flat per-sequence rows later (prepare_inputs). A raw Trajectory never carries a
+        # `*input_ids` key (it has `messages` + media), so keying on the suffix distinguishes the two
+        # without a bare-`input_ids`-only probe misreading a group row as raw and re-encoding it.
+        return not any(
+            k in ('input_ids', 'input_embedding') or k.endswith('_input_ids') or k.endswith('_input_embedding')
+            for k in inputs)
 
     def _lazy_wrap_model(self):
         if not self._model_wrapped:

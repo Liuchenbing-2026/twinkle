@@ -154,6 +154,19 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             nproc_per_node=nproc_per_node, ncpu_proc_per_node=ncpu_proc_per_node, device_groups=_device_group)
 
 
+def get_device_mesh() -> Optional[DeviceMesh]:
+    """The global default device mesh set by ``initialize`` (None before init).
+
+    A ``@remote_class`` model receives this mesh automatically: its wrapped ``__init__`` injects it
+    whenever the caller passes ``device_mesh=None`` (see ``_new_init_body``). A model that builds
+    *outside* that wrapper -- one overriding ``__init__`` rather than inheriting the wrapped base --
+    resolves its mesh through this accessor to uphold the same invariant: a constructed model holds a
+    real mesh, so the InputProcessor / OptimizerGroup it builds get proper DP placement instead of
+    silently degrading to single-rank loss normalisation and no metric aggregation.
+    """
+    return _device_mesh
+
+
 def get_device_placement(device_group=None) -> str:
     """Get the device placement graph, can be used to show the training topology.
 

@@ -112,6 +112,16 @@ class InputProcessor:
                     value = torch.from_numpy(value)
                 elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float, np.number)):
                     value = torch.tensor(value)
+                elif (key == 'labels' and isinstance(value, (int, float, np.number))
+                      and not isinstance(value, (bool, np.bool_))):
+                    # seq_cls / regression / reranker emit ONE scalar label per sequence (a class index or
+                    # a regression target), not a per-token sequence. The branches above only catch ndarray
+                    # and numeric LIST values, so a bare scalar would fall through, get collated into a
+                    # plain list/numpy [B] object, be skipped by to_device, and then blow up in the loss on
+                    # `labels.to(device)` (numpy has no `.to`). Wrap it as a 1-element tensor so it rides the
+                    # normal tensor path to a batched [B, 1] device tensor; SeqClsLoss reduces it back with
+                    # view(-1) / squeeze. bool is excluded because it subclasses int.
+                    value = torch.tensor([value])
                 elif key == 'position_ids' and not isinstance(value, torch.Tensor):
                     if value is None:
                         continue
@@ -780,13 +790,33 @@ class InputProcessor:
                         continue
                 feat[key] = torch.full((length, ), pad_value, dtype=torch.long, device=device)
 
+    #: Audio fields whose leading dim is the audio count and must survive collate under the batched
+    #: Qwen-audio contract (see _collate_macro_batch). The gemma4 channels-last contract instead
+    #: relies on the blanket squeeze folding a single-audio leading dim away, so the squeeze is only
+    #: skipped for these fields when the batch is on the Qwen-audio contract.
+    _QWEN_AUDIO_FIELDS = ('input_features', 'feature_attention_mask')
+
     def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
+        # Two mutually-exclusive audio contracts share the `input_features` field name and are told
+        # apart by the mask field that rides alongside it:
+        #   * gemma4 (mcore-bridge mm_gpts/gemma4.py) pairs `input_features` with `input_features_mask`
+        #     and wants channels-last features -- per-sample 2-D [plane0, plane1] given a trailing
+        #     singleton, the 1-D mask expanded to the feature plane, batch folded into dim 0.
+        #   * Qwen2.5-Omni / Qwen-audio pairs `input_features` with `feature_attention_mask` and
+        #     transformers' Qwen2_5OmniThinker.get_audio_features wants per-audio-batched
+        #     [N, freq, time] features + [N, time] mask, plain dim-0 concat (no reshape).
+        # Detect the contract once, before the squeeze: the squeeze would strip Qwen-audio's leading
+        # audio-count dim ([1, freq, time] -> [freq, time]), which the concat then folds into dim 0
+        # ([freq*N, time, 1]) and get_audio_features rejects against the [N, time] mask.
+        qwen_audio = any('feature_attention_mask' in _input for _input in inputs)
         # Work on local copies so squeezing doesn't mutate the caller's original samples.
         squeezed = []
         for _input in inputs:
             _input = dict(_input)
             for key in list(_input.keys()):
                 if isinstance(_input[key], torch.Tensor):
+                    if qwen_audio and key in self._QWEN_AUDIO_FIELDS:
+                        continue  # keep the audio-count leading dim intact for get_audio_features
                     _input[key] = _input[key].squeeze()
             squeezed.append(_input)
         inputs = squeezed
@@ -850,14 +880,22 @@ class InputProcessor:
             if values:
                 _values = []
                 for i, value in enumerate(values):
-                    if field == 'input_features':  # [freq_bins, time_steps] -> [freq_bins, time_steps, num_features]
-                        assert len(value.shape) == 2
-                        value = value.unsqueeze(-1)
-                    if field == 'input_features_mask':  # [freq_bins,] -> [freq_bins, time_steps]
-                        assert len(value.shape) == 1
-                        input_features_shape = vlm_fields['input_features'][i].shape
-                        assert value.shape[0] == input_features_shape[0]
-                        value = value.unsqueeze(1).expand(input_features_shape[:2])
+                    if not qwen_audio:
+                        # gemma4 channels-last audio contract: per-sample features are 2-D and get a
+                        # trailing singleton; the 1-D mask is expanded to the feature plane. Batch is
+                        # folded into dim 0 by the concat below.
+                        if field == 'input_features':  # [freq_bins, time_steps] -> [freq_bins, time_steps, num_features]
+                            assert len(value.shape) == 2
+                            value = value.unsqueeze(-1)
+                        if field == 'input_features_mask':  # [freq_bins,] -> [freq_bins, time_steps]
+                            assert len(value.shape) == 1
+                            input_features_shape = vlm_fields['input_features'][i].shape
+                            assert value.shape[0] == input_features_shape[0]
+                            value = value.unsqueeze(1).expand(input_features_shape[:2])
+                    # Qwen-audio contract: `input_features` is already [N, freq, time] and
+                    # `feature_attention_mask` is [N, time] (both kept un-squeezed above); the concat
+                    # below stacks them on dim 0 into the [sum(N), freq, time] / [sum(N), time] layout
+                    # get_audio_features expects. No reshape here.
                     if value.dim() == 1:
                         # image_thw may be squeezed
                         value = value.unsqueeze(0)
