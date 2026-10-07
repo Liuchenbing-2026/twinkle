@@ -11,7 +11,7 @@ import time
 import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
-from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, get_cosine_with_min_lr_schedule_with_warmup
 import twinkle
 from twinkle import DeviceMesh
 from twinkle.dataloader import DataLoader
@@ -26,10 +26,11 @@ from .checkpoint import install_sharded_optimizer_io, reshard_for_checkpoint
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='/models/Qwen3.5-4B')
-    parser.add_argument('--data', default='/workspace/decision_data/train.jsonl')
+    parser.add_argument('--data', default='/data/joint/train.jsonl')
     parser.add_argument('--output', required=True)
     parser.add_argument('--steps', type=int, default=3)
-    parser.add_argument('--schedule-steps', type=int, default=600)
+    parser.add_argument('--schedule-steps', type=int, default=120)
+    parser.add_argument('--model-only', action='store_true', help='Final weights only; no optimizer resume')
     parser.add_argument('--global-batch', type=int, default=16)
     parser.add_argument('--save-every', type=int, default=150)
     parser.add_argument('--resume')
@@ -102,9 +103,9 @@ def main():
     model.set_processor(DecisionProcessor, pad_token_id=tokenizer.pad_token_id, pad_multiple=128)
     model.set_loss('CrossEntropyLoss', reduction='sum')
     model.set_optimizer('AdamW', lr=2e-6, weight_decay=0.01, betas=(0.9, 0.999), eps=1e-8)
-    group.lr_scheduler = get_cosine_schedule_with_warmup(
+    group.lr_scheduler = get_cosine_with_min_lr_schedule_with_warmup(
         group.optimizer, num_warmup_steps=math.ceil(args.schedule_steps * 0.03),
-        num_training_steps=args.schedule_steps)
+        num_training_steps=args.schedule_steps, min_lr=2e-7)
     # Prevent early HCCL collectives from overlapping rank-zero CPU offload.
     cpu_group = dist.new_group(backend='gloo', timeout=timedelta(minutes=20))
     def fence():
@@ -131,7 +132,9 @@ def main():
         loader.resume_from_checkpoint(progress['consumed_train_samples'])
         model._load_rng_state(str(Path(args.resume) / f'rng_state_rank{rank}.pt'))
     output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
+    if rank == 0:
+        output.mkdir(parents=True, exist_ok=False)
+    fence()
     best_path = output / 'best-selection.json'
     best = json.loads(best_path.read_text()) if best_path.exists() else {'loss': float('inf')}
 
@@ -140,15 +143,17 @@ def main():
             dataset=Dataset(dataset_meta=DatasetMeta(data=validation_features)),
             device_mesh=mesh, batch_size=args.global_batch, shuffle=False,
             num_workers=0, drop_last=False)
-        loss_sum, decisions = 0.0, 0
+        loss_sum, decisions, cases = 0.0, 0, 0
         for validation_batch in validation_loader:
             model.forward_only(inputs=validation_batch)
             loss_sum += model.calculate_loss()
-            decisions += len(validation_batch)
+            cases += len(validation_batch)
+            decisions += sum(sum(token != -100 for token in row['labels']) for row in validation_batch)
         model.calculate_metric(is_training=False)
-        totals = torch.tensor([loss_sum, decisions], dtype=torch.float64)
+        totals = torch.tensor([loss_sum, decisions, cases], dtype=torch.float64)
         dist.all_reduce(totals, group=cpu_group)
-        if int(totals[1]) != len(validation_features):
+        expected_decisions = sum(sum(token != -100 for token in row['labels']) for row in validation_features)
+        if int(totals[1]) != expected_decisions or int(totals[2]) != len(validation_features):
             raise RuntimeError('Validation sampler did not cover each decision exactly once')
         loss = float(totals[0] / totals[1])
         if not math.isfinite(loss):
@@ -179,7 +184,7 @@ def main():
             validation_loss = evaluate() if validation_features else None
             fence()
             name = f'checkpoint-{step}'
-            model.save(name, output_dir=str(output), save_optimizer=True,
+            model.save(name, output_dir=str(output), save_optimizer=not args.model_only,
                        consumed_train_samples=loader.get_state()['consumed_train_samples'])
             fence()
             torch.save(model._get_training_rng_state(), output / name / f'rng_state_rank{rank}.pt')
@@ -208,7 +213,7 @@ def main():
         (output / 'training-complete.json').write_text(json.dumps({'step': group.cur_step,
             'checkpoint': str(output / f'checkpoint-{group.cur_step}'),
             'best_model_checkpoint': best.get('checkpoint'),
-            'accuracy_evaluated': False}, indent=2))
+            'accuracy_evaluated': False, 'optimizer_saved': not args.model_only}, indent=2))
     dist.destroy_process_group()
 
 

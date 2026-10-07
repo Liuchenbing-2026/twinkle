@@ -16,18 +16,20 @@ def main():
     tokenizer.add_special_tokens({'additional_special_tokens': ['<decision>']})
     processor = DecisionProcessor(pad_token_id=tokenizer.pad_token_id)
     count = 0
+    decisions = 0
     sample_features = []
     for split in ['train', 'validation', 'calibration', 'test']:
-        for line in Path('/workspace/decision_data', split + '.jsonl').read_text().splitlines():
+        for line in Path('/data/joint', split + '.jsonl').read_text().splitlines():
             record = json.loads(line)
             feature = encode_decision(tokenizer, record)
-            assert sum(x != -100 for x in feature['labels']) == 1
+            assert sum(x != -100 for x in feature['labels']) == len(record['decision_targets'])
             changed = deepcopy(record)
-            changed['decision_targets'] = ['Z']
+            changed['decision_targets'] = ['Z'] * len(record['decision_targets'])
             assert encode_decision(tokenizer, changed)['input_ids'] == feature['input_ids']
             if len(sample_features) < 4:
                 sample_features.append(feature)
             count += 1
+            decisions += len(record['decision_targets'])
     # Call the real processor on CPU in a container with no accelerator devices.
     # Twinkle's platform defaults to CUDA when neither accelerator exists.
     # Override device placement ONLY in this CPU numerical test.
@@ -36,7 +38,7 @@ def main():
     assert batch['input_ids'].shape[-1] % 128 == 0
     assert batch['use_cache'] is False
     assert batch['labels'].shape[-1] == len(batch['logits_to_keep'])
-    assert int((batch['labels'] != -100).sum()) == 4
+    assert int((batch['labels'] != -100).sum()) == sum(sum(x != -100 for x in f['labels']) for f in sample_features)
     # Smaller synthetic vocabulary gives an exact numerical/gradient comparison
     # without allocating a full sequence x Qwen vocabulary tensor on CPU.
     torch.manual_seed(42)
@@ -60,11 +62,13 @@ def main():
     a = torch.autograd.grad(actual, logits, retain_graph=True)[0]
     r = torch.autograd.grad(reference, logits)[0]
     torch.testing.assert_close(a, r, rtol=1e-12, atol=1e-12)
-    result = {'status': 'passed', 'encoded_decisions': count,
+    result = {'status': 'passed', 'encoded_records': count, 'encoded_decisions': decisions,
               'label_shift': 'exactly_once_before_Twinkle_CE', 'gold_not_in_input': True,
               'real_processor': True, 'test_device_override': 'cpu', 'loss_and_gradients_match_causal_CE': True,
               'npu_training_tested': False}
-    Path('/workspace/results/twinkle-cpu-contract.json').write_text(json.dumps(result, indent=2))
+    output = Path('/workspace/results/twinkle-cpu-contract.json')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
 
 
