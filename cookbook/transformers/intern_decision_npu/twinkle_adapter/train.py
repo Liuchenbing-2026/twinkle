@@ -18,7 +18,7 @@ from twinkle.dataloader import DataLoader
 from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.kernel.ops.fla.npu import apply_qwen3_5_fla
-from .data import encode_decision
+from .data import count_supervised_tokens, encode_decision
 from .processor import DecisionProcessor
 from .checkpoint import install_sharded_optimizer_io, reshard_for_checkpoint
 
@@ -145,14 +145,14 @@ def main():
             num_workers=0, drop_last=False)
         loss_sum, decisions, cases = 0.0, 0, 0
         for validation_batch in validation_loader:
+            decisions += count_supervised_tokens(validation_batch)
+            cases += len(validation_batch)
             model.forward_only(inputs=validation_batch)
             loss_sum += model.calculate_loss()
-            cases += len(validation_batch)
-            decisions += sum(sum(token != -100 for token in row['labels']) for row in validation_batch)
         model.calculate_metric(is_training=False)
         totals = torch.tensor([loss_sum, decisions, cases], dtype=torch.float64)
         dist.all_reduce(totals, group=cpu_group)
-        expected_decisions = sum(sum(token != -100 for token in row['labels']) for row in validation_features)
+        expected_decisions = count_supervised_tokens(validation_features)
         if int(totals[1]) != expected_decisions or int(totals[2]) != len(validation_features):
             raise RuntimeError('Validation sampler did not cover each decision exactly once')
         loss = float(totals[0] / totals[1])
@@ -181,12 +181,12 @@ def main():
                 handle.write(json.dumps(record, default=str) + '\n')
             print(json.dumps(record, default=str), flush=True)
         if step % args.save_every == 0 or step >= args.steps:
-            validation_loss = evaluate() if validation_features else None
             fence()
             name = f'checkpoint-{step}'
             model.save(name, output_dir=str(output), save_optimizer=not args.model_only,
                        consumed_train_samples=loader.get_state()['consumed_train_samples'])
             fence()
+            validation_loss = evaluate() if validation_features else None
             torch.save(model._get_training_rng_state(), output / name / f'rng_state_rank{rank}.pt')
             fence()
             if rank == 0:

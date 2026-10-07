@@ -7,11 +7,14 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from twinkle.loss import CrossEntropyLoss
-from .data import encode_decision
+from .data import count_supervised_tokens, encode_decision
 from .processor import DecisionProcessor
 
 
 def main():
+    raw = [{'labels': [-100, 2, -100]}, {'labels': [3, -100, 5, -100]}]
+    tensors = [{'labels': torch.tensor(row['labels']).unsqueeze(0)} for row in raw]
+    assert count_supervised_tokens(raw) == count_supervised_tokens(tensors) == 3
     tokenizer = AutoTokenizer.from_pretrained('/models/Qwen3.5-4B')
     tokenizer.add_special_tokens({'additional_special_tokens': ['<decision>']})
     processor = DecisionProcessor(pad_token_id=tokenizer.pad_token_id)

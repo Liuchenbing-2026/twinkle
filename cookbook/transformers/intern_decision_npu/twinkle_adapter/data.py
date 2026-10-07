@@ -2,6 +2,13 @@
 from collections.abc import Mapping
 from copy import deepcopy
 
+import torch
+
+
+def count_supervised_tokens(features):
+    """Count labels in raw rows and in the dataloader's singleton tensor rows."""
+    return sum(int(torch.as_tensor(row['labels']).ne(-100).sum().item()) for row in features)
+
 
 def encode_decision(tokenizer, record, max_length=8192):
     messages = deepcopy(record['messages'])
