@@ -1,4 +1,5 @@
 """CPU checks against Twinkle's actual processor and CE, with real tokenizer."""
+import argparse
 import json
 from copy import deepcopy
 from pathlib import Path
@@ -12,6 +13,9 @@ from .processor import DecisionProcessor
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, default=Path('/workspace/results/twinkle-cpu-contract.json'))
+    args = parser.parse_args()
     raw = [{'labels': [-100, 2, -100]}, {'labels': [3, -100, 5, -100]}]
     tensors = [{'labels': torch.tensor(row['labels']).unsqueeze(0)} for row in raw]
     assert count_supervised_tokens(raw) == count_supervised_tokens(tensors) == 3
@@ -69,7 +73,7 @@ def main():
               'label_shift': 'exactly_once_before_Twinkle_CE', 'gold_not_in_input': True,
               'real_processor': True, 'test_device_override': 'cpu', 'loss_and_gradients_match_causal_CE': True,
               'npu_training_tested': False}
-    output = Path('/workspace/results/twinkle-cpu-contract.json')
+    output = args.output
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))
