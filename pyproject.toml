@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [{ name = "ModelScope", email = "contact@modelscope.cn" }]
 requires-python = ">=3.10,<=3.13"
 dependencies = [
-  "numpy>=1.26.4,<2.3.0",
+  "numpy>=2.0.0,<2.3.0",
   "datasets",
   "omegaconf>=2.3.0,<3.0.0",
   "fastapi",
