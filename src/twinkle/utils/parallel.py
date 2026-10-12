@@ -4,10 +4,10 @@ import inspect
 import os
 import re
 from contextlib import contextmanager
+from datasets.config import HF_DATASETS_CACHE
 from datasets.utils.filelock import FileLock
 
-_LOCK_DIR = '.locks'
-os.makedirs(_LOCK_DIR, exist_ok=True)
+_LOCK_DIR = os.path.join(HF_DATASETS_CACHE, 'twinkle', 'locks')
 
 
 def _sanitize_lock_name(name: str) -> str:
@@ -155,6 +155,7 @@ def processing_lock(lock_file: str):
     Returns:
 
     """
+    os.makedirs(_LOCK_DIR, exist_ok=True)
     lock_name = _sanitize_lock_name(lock_file)
     lock: FileLock = FileLock(os.path.join(_LOCK_DIR, f'{lock_name}.lock'))  # noqa
 
