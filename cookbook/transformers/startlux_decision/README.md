@@ -126,6 +126,6 @@ Outputs contain per-question predictions, checkpoint/data hashes, correct/total 
 
 ## Validation status
 
-Both real 4B and 35B checkpoints have completed forward/backward, finite optimizer updates and checkpoint save on Ascend. SWIFT 35B was checked on four devices; Twinkle 35B on two. SWIFT full-state resume completed for both sizes, but its distributed 35B run is not bitwise identical to uninterrupted training. Twinkle 4B full-state resume after a completed accumulation group reproduced all adapter tensors exactly; its distributed 35B restore is still under validation.
+Both real 4B and 35B checkpoints have completed forward/backward, finite optimizer updates and checkpoint save on Ascend. The 35B run used two devices. Full-state resume after a completed accumulation group reproduced every adapter tensor exactly in the single-device 4B test. The distributed 35B test resumed and completed with finite updated weights; its continued-training result was not bitwise identical to uninterrupted training. These execution checks do not establish general model-quality gains.
 
 The included CPU tests cover candidate-only FP32 projection, causal readout, target masking, structured text input, train/evaluation overlap, original hard labels and LoRA exclusion of vision/output weights. These tests and short hardware runs establish execution contracts; independent accuracy gains and seven-suite acceptance remain experimental. No seven-suite improvement is claimed.
