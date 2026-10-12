@@ -6,7 +6,7 @@ This example fine-tunes the language backbone of an existing StartLux decision c
 | --- | --- |
 | Framework | Twinkle; existing Qwen3.5 dense/MoE loading and NPU kernels |
 | Checkpoints | StartLux-Decision-4B and StartLux-Decision-35B-A3B |
-| Trainable weights | Language attention / linear-attention LoRA, rank 16, alpha 32, dropout 0.05 |
+| Trainable weights | Rank 16 / alpha 32 / dropout 0.05; default attention LoRA, optional `--lora-scope language-linear` for all supported language-backbone linear layers |
 | Frozen weights | Original backbone weights, vision, embeddings and vocabulary projection |
 | Objective | Per-question soft cross-entropy at the last real prompt token; only legal candidates enter softmax |
 | Numerical head | 26 letter rows projected in FP32; original frozen weight/name retained for PEFT compatibility |
@@ -84,8 +84,8 @@ python train.py --model /models/StartLux-Decision-4B \
   --steps 120 --batch-size 2 --accum 4 --lr 2e-5 \
   --output /workspace/results/4b-run1
 
-# Four-device MoE run. MASTER_PORT must be free on this host.
-OMP_NUM_THREADS=16 python -m torch.distributed.run --nproc-per-node 4 \
+# Two-device MoE run. MASTER_PORT must be free on this host.
+OMP_NUM_THREADS=16 python -m torch.distributed.run --nproc-per-node 2 \
   --master-addr 127.0.0.1 --master-port 29613 train.py \
   --model /models/StartLux-Decision-35B-A3B \
   --train /data/train.jsonl --dev /data/validation.jsonl \
@@ -93,7 +93,7 @@ OMP_NUM_THREADS=16 python -m torch.distributed.run --nproc-per-node 4 \
   --output /workspace/results/35b-run1
 ```
 
-Twinkle uses FSDP ranks for the same examples (dp_size=1); effective batch is batch size × accumulation, not multiplied by FSDP world size.
+`--batch-size` is per data rank. The example passes the corresponding global micro-batch to Twinkle DataLoader, which partitions it across FSDP data ranks. Effective batch is batch size × accumulation × data world size (the FSDP world size in this recipe).
 Resume using the **full checkpoint**, not the adapter-only export. Keep model, data, batch/accumulation and process layout unchanged; resume from an intermediate checkpoint with the original total-step and scheduler configuration:
 
 ```bash
@@ -103,6 +103,8 @@ python train.py --model /models/StartLux-Decision-4B \
   --resume /workspace/results/4b-run1/checkpoint-50 \
   --output /workspace/results/4b-resumed
 ```
+
+The optional `--lora-scope language-linear` follows the official fine-tuning scope for supported linear modules, including dense/shared feed-forward projections. It excludes vision and the vocabulary head. Fused MoE expert parameter tensors are not ordinary linear modules and are not selected. Keep the scope unchanged when resuming.
 
 A short smoke run checks execution, not model quality. `validation.json` records pre/post loss, arguments and the trainable-parameter audit. Original fitted temperatures do not remain validated after an adapter changes weights.
 
@@ -124,4 +126,6 @@ Outputs contain per-question predictions, checkpoint/data hashes, correct/total 
 
 ## Validation status
 
-Real 4B checkpoints have completed forward/backward, optimizer updates and save in both frameworks; SWIFT has also resumed from its full checkpoint. Twinkle full-state resume also passed after the included optimizer restore fix. The included accumulation-boundary fix ensures updates happen after each complete group of micro-batches. Independent accuracy and real 35B acceptance are still being checked. No seven-suite improvement is claimed by this example yet.
+Both real 4B and 35B checkpoints have completed forward/backward, finite optimizer updates and checkpoint save on Ascend. SWIFT 35B was checked on four devices; Twinkle 35B on two. SWIFT full-state resume completed for both sizes, but its distributed 35B run is not bitwise identical to uninterrupted training. Twinkle 4B full-state resume after a completed accumulation group reproduced all adapter tensors exactly; its distributed 35B restore is still under validation.
+
+The included CPU tests cover candidate-only FP32 projection, causal readout, target masking, structured text input, train/evaluation overlap, original hard labels and LoRA exclusion of vision/output weights. These tests and short hardware runs establish execution contracts; independent accuracy gains and seven-suite acceptance remain experimental. No seven-suite improvement is claimed.

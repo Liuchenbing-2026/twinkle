@@ -6,7 +6,7 @@ import math
 import os
 import torch
 from decision_training import (audit_splits, audit_trainable, candidate_loss, collate, copy_metadata, encode_records,
-                               install_head)
+                               install_head, lora_targets)
 from pathlib import Path
 from peft import LoraConfig
 from transformers import AutoTokenizer
@@ -75,9 +75,10 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--save-steps', type=int, default=50)
     parser.add_argument('--steps', type=int, default=120)
-    parser.add_argument('--batch-size', type=int, default=2)
+    parser.add_argument('--batch-size', type=int, default=2, help='Micro-batch size per data rank')
     parser.add_argument('--accum', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lora-scope', choices=['attention', 'language-linear'], default='attention')
     parser.add_argument('--resume')
     args = parser.parse_args()
     if Path(args.output).exists() and not args.resume:
@@ -92,14 +93,15 @@ def main():
     dev, dev_ids = encode_records(args.dev, tokenizer)
     audit_splits(train_ids, dev_ids)
     generator = torch.Generator().manual_seed(42)
+    global_batch_size = args.batch_size * mesh.data_world_size
     ordered = []
-    while len(ordered) < args.steps * args.accum * args.batch_size:
+    while len(ordered) < args.steps * args.accum * global_batch_size:
         ordered.extend(train[i] for i in torch.randperm(len(train), generator=generator).tolist())
-    ordered = ordered[:args.steps * args.accum * args.batch_size]
+    ordered = ordered[:args.steps * args.accum * global_batch_size]
     loader = DataLoader(
         dataset=Dataset(dataset_meta=DatasetMeta(data=ordered)),
         device_mesh=mesh,
-        batch_size=args.batch_size,
+        batch_size=global_batch_size,
         shuffle=False,
         num_workers=0,
         drop_last=True)
@@ -116,13 +118,7 @@ def main():
     model._default_tokenizer = tokenizer
     model.add_adapter_to_model(
         'decision',
-        LoraConfig(
-            r=16,
-            lora_alpha=32,
-            lora_dropout=0.05,
-            target_modules=[
-                'q_proj', 'k_proj', 'v_proj', 'o_proj', 'in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a', 'out_proj'
-            ]))
+        LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, target_modules=lora_targets(model.model, args.lora_scope)))
     audit = audit_trainable(model.model)
     model.set_processor(DecisionProcessor, pad_token_id=tokenizer.pad_token_id)
     model.set_loss(DecisionLoss)
