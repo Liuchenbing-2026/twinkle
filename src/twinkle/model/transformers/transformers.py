@@ -1348,6 +1348,17 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         adapter_state = self.strategy.get_adapter_state_dict(self.model, adapter_name)
         adapter_suffix = f'.{adapter_name}.'
         modules_to_save_infix = f'.modules_to_save.{adapter_name}.'
+        # Strategies collect parameters without materializing the full backbone state.
+        # PEFT modules_to_save also require persistent buffers (e.g. calibration state).
+        model = self.strategy.unwrap_model(self.model)
+        for module_name, module in model.named_modules():
+            if modules_to_save_infix not in f'{module_name}.':
+                continue
+            for buffer_name, buffer in module.named_buffers(recurse=False):
+                if buffer_name in module._non_persistent_buffers_set:
+                    continue
+                key = f'{module_name}.{buffer_name}'
+                adapter_state[key] = Torch.to_local_tensor(buffer).detach().cpu()
         processed_state_dict = {}
         for key, value in adapter_state.items():
             if modules_to_save_infix in key:
