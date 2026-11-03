@@ -1,9 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Regression tests for ``twinkle.utils.network.find_node_ip``."""
+import socket
 import sys
 import types
 
-from twinkle.utils.network import find_node_ip
+import pytest
+
+from twinkle.utils.network import find_free_port, find_node_ip
 
 
 def _fake_psutil(interfaces):
@@ -53,3 +56,32 @@ def test_find_node_ip_ignores_non_ipv4(monkeypatch):
                  _addr('AF_INET6', 'fe80::1')],
     }))
     assert find_node_ip() == '127.0.0.1'
+
+
+@pytest.mark.parametrize('reuse', [False, True])
+def test_find_free_port_rejects_live_listener(reuse):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        if reuse:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, 'SO_REUSEPORT'):
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        listener.bind(('', 0))
+        listener.listen(1)
+        busy = listener.getsockname()[1]
+        with pytest.raises(RuntimeError, match='No free port'):
+            find_free_port(start_port=busy, retry=1)
+
+
+def test_find_free_port_without_reuseport(monkeypatch):
+    monkeypatch.delattr(socket, 'SO_REUSEPORT', raising=False)
+    port = find_free_port()
+    assert 0 < port <= 65535
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as consumer:
+        consumer.bind(('', port))
+
+
+def test_find_free_port_returns_bindable_port():
+    port = find_free_port()
+    assert 0 < port <= 65535
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as consumer:
+        consumer.bind(('', port))
